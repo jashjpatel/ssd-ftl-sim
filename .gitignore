@@ -1,0 +1,7 @@
+build/
+imgui.ini
+ftl_stats.csv
+*.bak
+.DS_Store
+.vscode/
+.idea/
