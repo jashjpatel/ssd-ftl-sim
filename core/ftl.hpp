@@ -22,6 +22,10 @@ struct Config {
     uint32_t   diesPerChannel = 1;           // dies sharing each channel
     uint32_t   planesPerDie   = 1;           // used for addressing only (multi-plane ops come later)
     uint32_t   channelXferUs  = 0;           // time to move one page over a channel (0 = ignore)
+
+    // ---- indirection unit (Step 3) ----
+    uint32_t   luPerIu        = 1;           // 4 KB LBAs per mapping entry (1 = 4 KB IU, 4 = 16 KB IU).
+                                             // One NAND page holds one IU; l2p has one entry per IU.
 };
 
 // Where a physical page really is. Blocks are interleaved across dies (block b lives on die
@@ -31,6 +35,7 @@ struct PhysAddr { uint32_t channel, die, plane, block, page; };
 
 struct Stats {
     uint64_t hostWrites = 0, nandWrites = 0, hostReads = 0;
+    uint64_t rmwReads = 0;          // Step 3: NAND reads needed to merge a partial-IU write (read-modify-write)
     uint64_t gcRuns = 0, migratedPages = 0, erases = 0;
     uint64_t simTimeUs = 0;
     uint64_t slcWrites = 0, qlcWrites = 0, directQlcWrites = 0;  // direct = host write that skipped SLC
@@ -43,7 +48,8 @@ class Ftl {
 public:
     explicit Ftl(const Config& cfg);
 
-    uint64_t logicalPages() const { return l2p.size(); }
+    uint64_t logicalPages() const { return l2p.size() * cfg_.luPerIu; }   // capacity in 4 KB LBAs
+    uint64_t mapEntries() const { return l2p.size(); }                     // one per IU (what the DRAM holds)
     const Nand& nand() const { return nand_; }
     const Config& config() const { return cfg_; }
     size_t freeBlocks() const { return freeBlocks_.size(); }        // QLC free pool
@@ -69,11 +75,11 @@ public:
     uint64_t dieFreeAtUs(uint32_t die) const { return dieFreeAtUs_[die]; }
     uint64_t channelFreeAtUs(uint32_t ch) const { return channelFreeAtUs_[ch]; }
     int64_t lpnAt(uint64_t ppn) const { return p2l[ppn]; }       // PPN -> LPN (-1 = none), for the GUI
-    int64_t ppnOf(uint64_t lpn) const { return l2p[lpn]; }       // LPN -> PPN (-1 = unmapped), no side effects
+    int64_t ppnOf(uint64_t lpn) const { return l2p[lpn / cfg_.luPerIu]; }       // LPN -> PPN (-1 = unmapped), no side effects
 
-    void    write(uint64_t lpn);
+    void    write(uint64_t lpn, uint32_t lbas = 1);   // lbas LBAs from lpn; must stay inside ONE IU (Step 3)
     int64_t read(uint64_t lpn);   // returns PPN, or -1 if unmapped
-    void    trim(uint64_t lpn);
+    void    trim(uint64_t lpn, uint32_t lbas = 1);    // unmaps every IU the range FULLY covers (Step 3)
     void    idle(uint64_t us);    // background time: fold full SLC blocks into QLC
     bool    checkInvariants() const;
 

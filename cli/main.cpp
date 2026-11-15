@@ -662,6 +662,122 @@ static void tcE5_gc_tail_latency() {
     CHECK(r.maxUs >= 3000);                                   // a GC always includes an erase
 }
 
+// ---------------------------------------------------------------------------
+// Step 3: indirection unit (IU) + read-modify-write
+// ---------------------------------------------------------------------------
+static Config iuConfig(uint32_t lu) {   // 16 blocks x 4 pages, no SLC, 16 KB IU when lu = 4
+    Config c; c.blocks = 16; c.pagesPerBlock = 4; c.opRatio = 0.25; c.slcBlocks = 0; c.luPerIu = lu;
+    return c;
+}
+static void runCmd(NvmeController& ctrl, NvmeCommand cmd) {
+    ctrl.submit(cmd); ctrl.process(1);
+    NvmeCompletion d{}; while (ctrl.popCompletion(d)) CHECK(d.status == NvmeStatus::Success);
+}
+
+static void tcI1_iu_mapping() {
+    std::printf("TC-I1: 4 LBAs share one map entry (16 KB IU)\n");
+    Ftl ftl(iuConfig(4));
+    CHECK(ftl.logicalPages() == ftl.mapEntries() * 4);
+    ftl.write(0);
+    ftl.write(1);                                          // same IU as LBA 0
+    uint32_t validPages = 0;
+    for (uint32_t b = 0; b < 16; ++b) validPages += ftl.nand().block(b).validCount;
+    CHECK(validPages == 1);                                // one IU = one page: LBA 0's copy was replaced
+    CHECK(ftl.mapEntries() * 4 == ftl.logicalPages() && ftl.mapEntries() == 48);
+    CHECK(ftl.ppnOf(0) == ftl.ppnOf(1) && ftl.ppnOf(1) == ftl.ppnOf(3));
+    CHECK(ftl.read(2) == ftl.ppnOf(0));
+    ftl.write(4);                                          // next IU
+    CHECK(ftl.ppnOf(4) >= 0 && ftl.ppnOf(4) != ftl.ppnOf(0));
+    CHECK(ftl.checkInvariants());
+}
+
+static void tcI2_read_modify_write() {
+    std::printf("TC-I2: a partial write into a mapped IU reads it first (RMW)\n");
+    Ftl ftl(iuConfig(4));
+    ftl.write(0);                                          // IU 0 was empty: nothing to read
+    CHECK(ftl.stats.rmwReads == 0);
+    const int64_t first = ftl.ppnOf(0);
+    ftl.write(1);                                          // IU 0 holds data: read, merge, rewrite all 16 KB
+    CHECK(ftl.stats.rmwReads == 1);
+    CHECK(ftl.stats.hostWrites == 2 && ftl.stats.nandWrites == 2);
+    CHECK(ftl.nand().block(uint32_t(first / 4)).pages[uint32_t(first % 4)] == PageState::Invalid);
+    ftl.write(0, 4);                                       // a whole IU: nothing to merge, no read
+    CHECK(ftl.stats.rmwReads == 1);
+    CHECK(ftl.stats.hostWrites == 6 && ftl.stats.nandWrites == 3);
+    bool threw = false;
+    try { ftl.write(2, 4); } catch (const std::invalid_argument&) { threw = true; }   // LBAs 2..5 span 2 IUs
+    CHECK(threw);
+    CHECK(ftl.checkInvariants());
+}
+
+static void tcI3_nvme_splits_at_iu() {
+    std::printf("TC-I3: NVMe splits a command at IU boundaries\n");
+    Ftl ftl(iuConfig(4));
+    NvmeController ctrl(ftl);
+    runCmd(ctrl, {1, NvmeOpcode::Write, 2, 5});            // LBAs 2..7: half of IU 0, all of IU 1
+    CHECK(ftl.stats.nandWrites == 2 && ftl.stats.rmwReads == 0 && ftl.stats.hostWrites == 6);
+    runCmd(ctrl, {2, NvmeOpcode::Write, 2, 5});            // again: IU 0 is mapped now -> RMW; IU 1 full -> none
+    CHECK(ftl.stats.nandWrites == 4 && ftl.stats.rmwReads == 1);
+    runCmd(ctrl, {3, NvmeOpcode::Write, 8, 3});            // an aligned 16 KB write: one page, no read
+    CHECK(ftl.stats.nandWrites == 5 && ftl.stats.rmwReads == 1);
+    CHECK(ftl.checkInvariants());
+}
+
+static void tcI4_trim_whole_ius() {
+    std::printf("TC-I4: TRIM only unmaps IUs it fully covers\n");
+    Ftl ftl(iuConfig(4));
+    NvmeController ctrl(ftl);
+    ftl.write(0, 4); ftl.write(4, 4);
+    ftl.trim(0, 2);                                        // half of IU 0: the other half still has data
+    CHECK(ftl.ppnOf(0) >= 0);
+    runCmd(ctrl, {1, NvmeOpcode::DatasetMgmt, 2, 5});      // LBAs 2..7: half of IU 0, all of IU 1
+    CHECK(ftl.ppnOf(0) >= 0);
+    for (uint64_t l = 4; l < 8; ++l) CHECK(ftl.ppnOf(l) == -1);
+    ftl.trim(0, 4);
+    CHECK(ftl.ppnOf(0) == -1 && ftl.ppnOf(3) == -1);
+    CHECK(ftl.checkInvariants());
+}
+
+static void tcI5_rmw_latency() {
+    std::printf("TC-I5: the RMW read adds latency (event clock)\n");
+    Config c = iuConfig(4); c.timing = {80, 2500, 3000}; c.channelXferUs = 10;
+    Ftl ftl(c);
+    ftl.setNow(0); ftl.write(0);                           // empty IU: 10 transfer + 2500 program
+    CHECK(ftl.lastDoneUs() == 2510);
+    ftl.setNow(10000); ftl.write(1);                       // read 80 + back 10, then transfer 10 + program 2500
+    CHECK(ftl.lastDoneUs() == 10000 + 80 + 10 + 10 + 2500);
+    ftl.setNow(20000); ftl.write(4, 4);                    // full IU: no read
+    CHECK(ftl.lastDoneUs() == 20000 + 10 + 2500);
+}
+
+// same LBA capacity for every IU size: bigger IU -> fewer, bigger pages
+static Config iuDrive(uint32_t lu) { Config c; c.blocks = 1024 / lu; c.slcBlocks = 0; c.luPerIu = lu; return c; }
+struct IuRun { double byteWaf, rmwPerHost; uint64_t mapEntries; };
+static IuRun iuRun(uint32_t lu, bool random4k, uint64_t commands) {
+    Ftl ftl(iuDrive(lu));
+    NvmeController ctrl(ftl);
+    const uint64_t n = ftl.logicalPages() / 4 * 4;
+    for (uint64_t l = 0; l < n; l += 4) runCmd(ctrl, {0, NvmeOpcode::Write, l, 3});   // fill with 16 KB writes
+    ftl.stats = Stats{};
+    Rng rng(7);
+    for (uint64_t i = 0; i < commands; ++i)
+        runCmd(ctrl, random4k ? NvmeCommand{0, NvmeOpcode::Write, rng.below(n), 0}
+                              : NvmeCommand{0, NvmeOpcode::Write, (i * 4) % n, 3});
+    const Stats& s = ftl.stats;
+    return {double(s.nandWrites) * lu / double(s.hostWrites), double(s.rmwReads) / double(s.hostWrites), ftl.mapEntries()};
+}
+
+static void tcI6_iu_tradeoff() {
+    std::printf("TC-I6: a 16 KB IU: 4x smaller map, free for 16 KB writes, costly for 4 KB random\n");
+    const IuRun r1 = iuRun(1, true, 50000), r4 = iuRun(4, true, 50000), s4 = iuRun(4, false, 20000);
+    std::printf("  map entries %llu -> %llu; 4 KB random: %.2f -> %.2f NAND bytes per host byte; 16 KB aligned: %.2f\n",
+                (unsigned long long)r1.mapEntries, (unsigned long long)r4.mapEntries, r1.byteWaf, r4.byteWaf, s4.byteWaf);
+    CHECK(r1.mapEntries == 4 * r4.mapEntries);
+    CHECK(r1.rmwPerHost == 0 && r4.rmwPerHost > 0.99);    // every 4 KB write into a 16 KB IU needs a read
+    CHECK(r4.byteWaf > 3.5 * r1.byteWaf);                  // ...and rewrites 16 KB
+    CHECK(s4.byteWaf < 1.01 && s4.rmwPerHost == 0);        // aligned 16 KB writes: no penalty at all
+}
+
 static void run(void (*test)()) {
     try { test(); }
     catch (const std::exception& e) { std::printf("  FAIL: exception: %s\n", e.what()); ++failures; }
@@ -701,6 +817,12 @@ int main() {
     run(tcE3_qd1_no_parallelism);
     run(tcE4_qd_fills_dies);
     run(tcE5_gc_tail_latency);
+    run(tcI1_iu_mapping);
+    run(tcI2_read_modify_write);
+    run(tcI3_nvme_splits_at_iu);
+    run(tcI4_trim_whole_ius);
+    run(tcI5_rmw_latency);
+    run(tcI6_iu_tradeoff);
     std::printf(failures ? "\n%d CHECK(s) FAILED\n" : "\nAll checks passed\n", failures);
     return failures ? 1 : 0;
 }
