@@ -9,6 +9,7 @@ Ftl::Ftl(const Config& cfg)
     const uint32_t dies = cfg.channels * cfg.diesPerChannel;
     if (dies == 0 || cfg.blocks % dies != 0) throw std::invalid_argument("blocks must divide evenly across dies");
     if (cfg.slcBlocks % dies != 0) throw std::invalid_argument("slcBlocks must be a multiple of the die count");
+    if (cfg.luPerIu == 0) throw std::invalid_argument("luPerIu must be at least 1");
     activeBlock_.assign(dies, -1);
     activeSlcBlock_.assign(dies, -1);
     dieBusyUs_.assign(dies, 0);
@@ -205,8 +206,42 @@ void Ftl::runGc(uint32_t die) {
    // less gc means lower waf which is good and erasing a full block is expensive in time
 }
 
-void Ftl::write(uint64_t lpn) {
-    if (lpn >= l2p.size()) throw std::out_of_range("write: LPN beyond logical capacity");
+void Ftl::write(uint64_t lpn, uint32_t lbas) {
+    if (lbas == 0 || lpn >= logicalPages() || lbas > logicalPages() - lpn) throw std::out_of_range("write: LPN beyond logical capacity");
+
+    // ---- indirection unit (Step 3): the map has one entry per IU, not per LBA ----
+    // TODO I1: which IU do these LBAs belong to? (each IU holds cfg_.luPerIu LBAs: LBAs 0-3 -> IU 0, 4-7 -> IU 1, ...)
+    //   Then throw std::invalid_argument("write: range crosses an IU boundary") if the LAST LBA
+    //   (lpn + lbas - 1) is in a different IU than the first one.
+
+    // to determine which indirection unit the logical block address falls into
+    const uint64_t iu = lpn/ cfg_.luPerIu;
+
+    // handle the logic where this is an attempted write to multiple IUs
+    if ((lpn + lbas - 1) / cfg_.luPerIu != iu){
+        throw std::invalid_argument("write: range crosses an IU boundary");
+    }
+
+    // ---- read-modify-write: a partial write into an IU that already holds data ----
+    // The new page must hold the WHOLE IU, so the LBAs we are NOT writing have to be read from the old page first.
+    // TODO I2: when is that read needed? Two conditions, both must be true:
+    //   - the write covers only PART of the IU      (compare lbas with cfg_.luPerIu)
+    //   - the IU already has data somewhere          (l2p[iu] ... ?)
+    //   and inside: count it with ++stats.rmwReads (the timing lines below are given)
+    if (lbas < cfg_.luPerIu && l2p[iu] >= 0) {
+        ++stats.rmwReads;
+        const uint32_t oldDie = dieOf(uint32_t(uint64_t(l2p[iu]) / cfg_.pagesPerBlock));
+        const uint32_t oldCh = channelOf(oldDie);
+        stats.simTimeUs += cfg_.timing.readUs + cfg_.channelXferUs;
+        dieBusyUs_[oldDie] += cfg_.timing.readUs + cfg_.channelXferUs;
+        channelBusyUs_[oldCh] += cfg_.channelXferUs;
+        // event clock: read the old IU exactly like read() does; the merged data is only ready after that,
+        // so the write below starts from then instead of from the arrival time
+        dieFreeAtUs_[oldDie] = std::max(dieFreeAtUs_[oldDie], nowUs_) + cfg_.timing.readUs;
+        channelFreeAtUs_[oldCh] = std::max(channelFreeAtUs_[oldCh], dieFreeAtUs_[oldDie]) + cfg_.channelXferUs;
+        nowUs_ = channelFreeAtUs_[oldCh];
+    }
+    // (given) from here on the map is indexed by iu, not lpn: l2p[iu], p2l[ppn] = iu, and hostWrites += lbas
 
     // ---- striping: each host write goes to the next die in turn ----
     // TODO G1: pick this write's die round-robin.
@@ -236,9 +271,9 @@ void Ftl::write(uint64_t lpn) {
         
         // TODO c: copy the 4 lines of "2. Out-of-place update" from below
         // when its out-of-place invalidate the old copy
-        if(l2p[lpn] >= 0){
-            nand_.invalidate(uint64_t(l2p[lpn]));
-            p2l[uint64_t(l2p[lpn])] = -1;
+        if(l2p[iu] >= 0){
+            nand_.invalidate(uint64_t(l2p[iu]));
+            p2l[uint64_t(l2p[iu])] = -1;
         }
 
         // program the next page of the SLC active block
@@ -246,15 +281,15 @@ void Ftl::write(uint64_t lpn) {
         // update time
         nand_.program(ppn, ++tick_);
         // update both maps
-        l2p[lpn] = int64_t(ppn);
-        p2l[ppn] = int64_t(lpn);
+        l2p[iu] = int64_t(ppn);
+        p2l[ppn] = int64_t(iu);
 
 
         // if the block filled up just now... remember it 
         if (nand_.block(uint32_t(activeSlcBlock_[die])).writePtr == nand_.block(uint32_t(activeSlcBlock_[die])).capacity)
             fullSlcBlocks_.push_back(uint32_t(activeSlcBlock_[die]));
 
-        ++stats.hostWrites;
+        stats.hostWrites += lbas;
         ++stats.nandWrites;
         ++stats.slcWrites;
         stats.simTimeUs += cfg_.slcTiming.programUs + cfg_.channelXferUs;   // fast SLC program (150 us)
@@ -280,19 +315,19 @@ void Ftl::write(uint64_t lpn) {
         activeBlock_[die] = allocateBlock(die);
 
     // 2. Out-of-place update: invalidate the old copy
-    if (l2p[lpn] >= 0) {
-        nand_.invalidate(uint64_t(l2p[lpn]));
-        p2l[uint64_t(l2p[lpn])] = -1;
+    if (l2p[iu] >= 0) {
+        nand_.invalidate(uint64_t(l2p[iu]));
+        p2l[uint64_t(l2p[iu])] = -1;
     }
 
     // 3. Program the next page of the active block and update both maps
     const uint64_t ppn = uint64_t(activeBlock_[die]) * cfg_.pagesPerBlock
                        + nand_.block(uint32_t(activeBlock_[die])).writePtr;
     nand_.program(ppn, ++tick_);
-    l2p[lpn] = int64_t(ppn);
-    p2l[ppn] = int64_t(lpn);
+    l2p[iu] = int64_t(ppn);
+    p2l[ppn] = int64_t(iu);
 
-    ++stats.hostWrites;
+    stats.hostWrites += lbas;
     ++stats.nandWrites;
     ++stats.qlcWrites;          // this host write went to QLC
     ++stats.directQlcWrites;    // ...and skipped the SLC cache
@@ -411,8 +446,9 @@ void Ftl::idle(uint64_t us) {
 }
 
 int64_t Ftl::read(uint64_t lpn) {
-    if (lpn >= l2p.size()) throw std::out_of_range("read: LPN beyond logical capacity");
+    if (lpn >= logicalPages()) throw std::out_of_range("read: LPN beyond logical capacity");
     ++stats.hostReads;
+    lpn /= cfg_.luPerIu;                                         // (given) look up the IU that holds this LBA
     if (l2p[lpn] >= 0) {                                         // unmapped: no NAND access
         const uint32_t die = dieOf(uint32_t(uint64_t(l2p[lpn]) / cfg_.pagesPerBlock));
         stats.simTimeUs += cfg_.timing.readUs + cfg_.channelXferUs;
@@ -420,29 +456,37 @@ int64_t Ftl::read(uint64_t lpn) {
         //   its channel += channelXferUs (the data comes back across the channel to the controller).
         dieBusyUs_[die] += cfg_.timing.readUs + cfg_.channelXferUs;
         channelBusyUs_[channelOf(die)] += cfg_.channelXferUs;
-        // TODO E2 (event clock, read): the REVERSE order of a write
+        // TODO E2 (event clock, read): the REVERSE order of a write.
         //   1. the die reads the page: starts when the die is free AND the command has arrived, + readUs
-        dieFreeAtUs_[die] = std::max(dieFreeAtUs_[die], nowUs_) + cfg_.timing.readUs;
         //   2. the data crosses the channel back: starts when the bus is free AND the read is done, + transfer
-        channelFreeAtUs_[channelOf(die)] = std::max(channelFreeAtUs_[channelOf(die)], dieFreeAtUs_[die]) + cfg_.channelXferUs;
         //   3. done when the transfer finishes
-        //   (no `ch` variable here: use channelOf(die))
+        dieFreeAtUs_[die] = std::max(dieFreeAtUs_[die], nowUs_) + cfg_.timing.readUs;
+        channelFreeAtUs_[channelOf(die)] = std::max(channelFreeAtUs_[channelOf(die)], dieFreeAtUs_[die]) + cfg_.channelXferUs;
         lastDoneUs_ = channelFreeAtUs_[channelOf(die)];
-    } 
-
-    else {
+    } else {
         lastDoneUs_ = nowUs_;                                    // unmapped: answered at once
     }
-    
     return l2p[lpn];
 }
 
-void Ftl::trim(uint64_t lpn) {
-    if (lpn >= l2p.size()) throw std::out_of_range("trim: LPN beyond logical capacity");
-    if (l2p[lpn] < 0) return;
-    nand_.invalidate(uint64_t(l2p[lpn]));
-    p2l[uint64_t(l2p[lpn])] = -1;
-    l2p[lpn] = -1;
+void Ftl::trim(uint64_t lpn, uint32_t lbas) {
+    if (lbas == 0 || lpn >= logicalPages() || lbas > logicalPages() - lpn) throw std::out_of_range("trim: LPN beyond logical capacity");
+    // Only IUs the range covers COMPLETELY can be unmapped: a partly trimmed IU still holds other LBAs' data.
+    // TODO I3: the range is LBAs [lpn, lpn + lbas). Find the IUs fully inside it:
+    //   first = the first IU that STARTS inside the range   (round lpn / luPerIu UP)
+    //   endIu = one past the last IU that ENDS inside it    (round (lpn + lbas) / luPerIu DOWN)
+    //   example, 4 LBAs per IU, LBAs 2..9 = [2, 10): IU 0 = 0-3 (partial), IU 1 = 4-7 (full), IU 2 = 8-11 (partial)
+    //            -> first = 1, endIu = 2  -> only IU 1 is unmapped
+    //   hint: integer division rounds down; (a + b - 1) / b rounds up
+    const uint64_t first = (lpn + cfg_.luPerIu - 1)/ cfg_.luPerIu;
+    const uint64_t endIu = (lpn + lbas)/cfg_.luPerIu;
+
+    for (uint64_t iu = first; iu < endIu; ++iu) {
+        if (l2p[iu] < 0) continue;
+        nand_.invalidate(uint64_t(l2p[iu]));
+        p2l[uint64_t(l2p[iu])] = -1;
+        l2p[iu] = -1;
+    }
 }
 
 bool Ftl::checkInvariants() const {

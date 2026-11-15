@@ -2,6 +2,7 @@
 // Build target: ftl_experiments.  These are the numbers for your README.
 #include <cstdio>
 #include "workload.hpp"
+#include "nvme.hpp"
 
 static void header() {
     std::printf("%-38s %9s %8s %7s %8s %6s %8s %8s %6s %9s\n",
@@ -91,6 +92,28 @@ int main() {
                     (unsigned long long)r.p50Us, (unsigned long long)r.p99Us, (unsigned long long)r.maxUs,
                     (unsigned long long)r.gcRuns);
     }
-    std::printf("\n");
+    std::printf("\n-- 8. indirection unit size (same LBA capacity; drive filled with 16 KB writes first)\n");
+    std::printf("%-6s %12s %24s %24s\n", "IU", "map (KB)", "4 KB random: NAND/host", "16 KB aligned: NAND/host");
+    for (uint32_t lu : {1u, 2u, 4u, 8u}) {
+        double waf[2] = {0, 0};
+        uint64_t entries = 0;
+        for (int mode = 0; mode < 2; ++mode) {
+            Config c = drive; c.blocks = 1024 / lu; c.slcBlocks = 0; c.luPerIu = lu;
+            Ftl ftl(c);
+            NvmeController ctrl(ftl);
+            auto run = [&](NvmeCommand cmd) { ctrl.submit(cmd); ctrl.process(1); NvmeCompletion d{}; while (ctrl.popCompletion(d)) {} };
+            const uint64_t n = ftl.logicalPages() / 4 * 4;
+            for (uint64_t l = 0; l < n; l += 4) run({0, NvmeOpcode::Write, l, 3});
+            ftl.stats = Stats{};
+            Rng rng(7);
+            for (uint64_t i = 0; i < 100000; ++i)
+                run(mode == 0 ? NvmeCommand{0, NvmeOpcode::Write, rng.below(n), 0}
+                              : NvmeCommand{0, NvmeOpcode::Write, (i * 4) % n, 3});
+            waf[mode] = double(ftl.stats.nandWrites) * lu / double(ftl.stats.hostWrites);
+            entries = ftl.mapEntries();
+        }
+        std::printf("%3u KB %12.0f %24.2f %24.2f\n", lu * 4, double(entries) * 4 / 1024.0, waf[0], waf[1]);
+    }
+    std::printf("(map = 4 bytes per entry. At 122 TB a 4 KB IU needs ~120 GB of map; a 16 KB IU ~30 GB.)\n\n");
     return 0;
 }
