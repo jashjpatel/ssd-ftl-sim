@@ -585,6 +585,83 @@ static void tcG5_parallel_speedup() {
     CHECK(ftl.channelBusyUs(0) == 1024 * 500);
 }
 
+// ---------------------------------------------------------------------------
+// Step 2: event clock + queue depth
+// ---------------------------------------------------------------------------
+static Config qdConfig(uint32_t channels, uint32_t diesPerChannel) {
+    Config c; c.slcBlocks = 0; c.channels = channels; c.diesPerChannel = diesPerChannel;
+    c.timing = {80, 2500, 3000}; c.channelXferUs = 10;
+    return c;
+}
+static WorkloadConfig seqFresh() { WorkloadConfig w; w.pattern = Pattern::Sequential; w.precondition = false; return w; }
+
+static void tcE1_die_and_channel_waits() {
+    std::printf("TC-E1: a command waits for a busy channel and a busy die\n");
+    Config c = qdConfig(1, 2); c.channelXferUs = 100;        // 2 dies share ONE channel
+    Ftl ftl(c);
+    ftl.setNow(0); ftl.write(0);                              // die 0: bus 0-100, program 100-2600
+    CHECK(ftl.lastDoneUs() == 2600);
+    ftl.setNow(0); ftl.write(1);                              // die 1: waits for the bus (100-200), program 200-2700
+    CHECK(ftl.lastDoneUs() == 2700);
+    ftl.setNow(0); ftl.write(2);                              // die 0 again: bus 200-300, but die 0 is busy until 2600
+    CHECK(ftl.lastDoneUs() == 2600 + 2500);
+    ftl.setNow(10000); ftl.read(0);                           // read: die reads 10000-10080, then bus 10080-10180
+    CHECK(ftl.lastDoneUs() == 10180);
+    ftl.setNow(20000); ftl.read(500);                         // never written: no NAND access
+    CHECK(ftl.lastDoneUs() == 20000);
+}
+
+static void tcE2_percentile() {
+    std::printf("TC-E2: percentiles (nearest rank)\n");
+    std::vector<uint64_t> v;
+    for (uint64_t i = 100; i >= 1; --i) v.push_back(i);       // 100 .. 1, unsorted on purpose
+    CHECK(percentile(v, 50) == 50);
+    CHECK(percentile(v, 99) == 99);
+    CHECK(percentile(v, 100) == 100);
+    CHECK(percentile({7}, 99) == 7);
+    CHECK(percentile({}, 50) == 0);
+}
+
+static void tcE3_qd1_no_parallelism() {
+    std::printf("TC-E3: at queue depth 1, 4 dies are no faster than 1\n");
+    const QdResult one = runQueueDepth(qdConfig(1, 1), seqFresh(), 1, 2000);
+    const QdResult four = runQueueDepth(qdConfig(2, 2), seqFresh(), 1, 2000);
+    std::printf("  QD1: 1 die %.0f IOPS, 4 dies %.0f IOPS, latency %.0f us\n", one.iops, four.iops, four.avgLatencyUs);
+    CHECK(one.p50Us == 2510 && one.maxUs == 2510);           // every write: 10 us transfer + 2500 us program
+    CHECK(four.iops == one.iops);                             // only one command in flight -> only one die busy
+}
+
+static void tcE4_qd_fills_dies() {
+    std::printf("TC-E4: queue depth = number of dies -> full speed, same latency\n");
+    const QdResult q1 = runQueueDepth(qdConfig(2, 2), seqFresh(), 1, 2000);
+    const QdResult q4 = runQueueDepth(qdConfig(2, 2), seqFresh(), 4, 2000);
+    const QdResult q16 = runQueueDepth(qdConfig(2, 2), seqFresh(), 16, 2000);
+    std::printf("  4 dies: QD1 %.0f, QD4 %.0f, QD16 %.0f IOPS; p50 %llu / %llu / %llu us\n", q1.iops, q4.iops, q16.iops,
+                (unsigned long long)q1.p50Us, (unsigned long long)q4.p50Us, (unsigned long long)q16.p50Us);
+    CHECK(q4.iops > 3.9 * q1.iops);                           // 4 dies busy at once
+    CHECK(q4.p50Us == 2510);                                  // ...and nobody waited
+    CHECK(q16.iops < 1.01 * q4.iops);                         // more QD can't beat 4 busy dies
+    CHECK(q16.p50Us == 4 * 2500);                             // the extra commands just queue (each waits 3 programs)
+    for (const QdResult* r : {&q1, &q4, &q16}) {              // Little's law: latency x throughput = queue depth
+        const double inFlight = r->avgLatencyUs * r->iops / 1e6;
+        const double qd = r == &q1 ? 1 : r == &q4 ? 4 : 16;
+        CHECK(inFlight > 0.98 * qd && inFlight < 1.02 * qd);
+    }
+}
+
+static void tcE5_gc_tail_latency() {
+    std::printf("TC-E5: GC on a die makes the host commands behind it wait (tail latency)\n");
+    WorkloadConfig wl; wl.pattern = Pattern::UniformRandom; wl.precondition = true;
+    const QdResult r = runQueueDepth(qdConfig(2, 2), wl, 1, 20000);
+    std::printf("  random writes, full drive: p50 %llu us, p99 %llu us, max %llu us, %llu GC runs\n",
+                (unsigned long long)r.p50Us, (unsigned long long)r.p99Us, (unsigned long long)r.maxUs,
+                (unsigned long long)r.gcRuns);
+    CHECK(r.gcRuns > 0);
+    CHECK(r.p50Us == 2510);                                   // most writes never meet a GC
+    CHECK(r.p99Us > 20 * r.p50Us);                            // the unlucky 1% wait for a whole GC
+    CHECK(r.maxUs >= 3000);                                   // a GC always includes an erase
+}
+
 static void run(void (*test)()) {
     try { test(); }
     catch (const std::exception& e) { std::printf("  FAIL: exception: %s\n", e.what()); ++failures; }
@@ -619,6 +696,11 @@ int main() {
     run(tcG3_striping);
     run(tcG4_per_die_gc);
     run(tcG5_parallel_speedup);
+    run(tcE1_die_and_channel_waits);
+    run(tcE2_percentile);
+    run(tcE3_qd1_no_parallelism);
+    run(tcE4_qd_fills_dies);
+    run(tcE5_gc_tail_latency);
     std::printf(failures ? "\n%d CHECK(s) FAILED\n" : "\nAll checks passed\n", failures);
     return failures ? 1 : 0;
 }

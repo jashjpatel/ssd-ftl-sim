@@ -77,3 +77,20 @@ struct ExperimentResult {
 // Build a drive, optionally precondition it, run the workload through an
 // NvmeController, and collect the results.
 ExperimentResult runExperiment(const Config& drive, const WorkloadConfig& wl);
+
+// ---- Step 2: queue depth ----
+// A closed-loop host: it keeps `qd` write commands in flight. Whenever one completes, it submits the
+// next one at that moment. This is how fio / real benchmarks measure SSDs ("4K random write, QD32").
+struct QdResult {
+    uint64_t commands = 0;
+    uint64_t totalUs = 0;            // from the first submit to the last completion
+    double   iops = 0;               // commands per second
+    double   avgLatencyUs = 0;
+    uint64_t p50Us = 0, p99Us = 0, maxUs = 0;
+    uint64_t gcRuns = 0;
+    std::vector<uint64_t> latenciesUs;   // per command, in submit order
+};
+QdResult runQueueDepth(const Config& drive, const WorkloadConfig& wl, uint32_t qd, uint64_t commands);
+
+// The latency below which pct percent of the commands finished (pct = 50 -> median, 99 -> p99).
+uint64_t percentile(std::vector<uint64_t> latencies, double pct);

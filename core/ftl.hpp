@@ -60,6 +60,14 @@ public:
     uint64_t dieBusyUs(uint32_t die) const { return dieBusyUs_[die]; }
     uint64_t channelBusyUs(uint32_t ch) const { return channelBusyUs_[ch]; }
     uint64_t makespanUs() const;               // time if dies and channels work in parallel = the busiest one
+
+    // ---- event clock (Step 2) ----
+    // The host says WHEN each command arrives (setNow), the FTL schedules it on its die and channel,
+    // and lastDoneUs() says when it finished. A die or channel that is still busy makes it wait.
+    void     setNow(uint64_t us) { nowUs_ = us; }
+    uint64_t lastDoneUs() const { return lastDoneUs_; }
+    uint64_t dieFreeAtUs(uint32_t die) const { return dieFreeAtUs_[die]; }
+    uint64_t channelFreeAtUs(uint32_t ch) const { return channelFreeAtUs_[ch]; }
     int64_t lpnAt(uint64_t ppn) const { return p2l[ppn]; }       // PPN -> LPN (-1 = none), for the GUI
     int64_t ppnOf(uint64_t lpn) const { return l2p[lpn]; }       // LPN -> PPN (-1 = unmapped), no side effects
 
@@ -87,6 +95,10 @@ private:
     uint32_t nextDie_ = 0;                    // round-robin striping: die for the next host write
     std::vector<uint64_t> dieBusyUs_;         // total time each die has spent working
     std::vector<uint64_t> channelBusyUs_;     // total time each channel has spent transferring
+    uint64_t nowUs_ = 0;                      // arrival time of the current host command
+    uint64_t lastDoneUs_ = 0;                 // completion time of the last host command
+    std::vector<uint64_t> dieFreeAtUs_;       // when each die finishes everything it has been given
+    std::vector<uint64_t> channelFreeAtUs_;   // when each channel's bus is free again
     std::deque<uint32_t> freeSlcBlocks_;      // erased SLC blocks
     std::deque<uint32_t> fullSlcBlocks_;      // full SLC blocks, oldest first (folded in hour 4)
 };

@@ -13,6 +13,8 @@ Ftl::Ftl(const Config& cfg)
     activeSlcBlock_.assign(dies, -1);
     dieBusyUs_.assign(dies, 0);
     channelBusyUs_.assign(cfg.channels, 0);
+    dieFreeAtUs_.assign(dies, 0);
+    channelFreeAtUs_.assign(cfg.channels, 0);
 
     const uint64_t physPages = uint64_t(cfg.blocks) * cfg.pagesPerBlock;
     // get the number of pages for qlc
@@ -174,7 +176,11 @@ void Ftl::runGc(uint32_t die) {
         // update time to account for read it from the victim + program it into the active block
         stats.simTimeUs += cfg_.timing.readUs + cfg_.timing.programUs;
 
-        // TODO G4 (GC copy): this die += QLC read + QLC program. Copyback stays inside the die: no channel.        dieBusyUs_[die] += cfg_.timing.readUs + cfg_.timing.programUs;
+        // TODO G4 (GC copy): this die += QLC read + QLC program. Copyback stays inside the die: no channel.
+        dieBusyUs_[die] += cfg_.timing.readUs + cfg_.timing.programUs;
+        // event clock (given): GC work is queued on this die, starting no earlier than now.
+        // A host write that comes next on this die has to wait for it -> that's GC tail latency.
+        dieFreeAtUs_[die] = std::max(dieFreeAtUs_[die], nowUs_) + cfg_.timing.readUs + cfg_.timing.programUs;
     }
         // every valid page has moved out, so wipe the whole block
         nand_.erase(uint32_t(victim));
@@ -190,6 +196,7 @@ void Ftl::runGc(uint32_t die) {
         stats.simTimeUs += cfg_.timing.eraseUs;
         // TODO G4 (GC erase): this die += QLC erase.
         dieBusyUs_[die] += cfg_.timing.eraseUs;
+        dieFreeAtUs_[die] = std::max(dieFreeAtUs_[die], nowUs_) + cfg_.timing.eraseUs;
 
     //   Questions to answer for yourself:
     //   - Why must the victim never be activeBlock_?
@@ -256,6 +263,11 @@ void Ftl::write(uint64_t lpn) {
         //   ...and this die += channelXferUs + SLC program (the die is busy while receiving, then programs).
         channelBusyUs_[ch] += cfg_.channelXferUs;
         dieBusyUs_[die] += cfg_.channelXferUs + cfg_.slcTiming.programUs;
+        // event clock (given, use it as the example for TODO E1
+
+        channelFreeAtUs_[ch] = std::max(channelFreeAtUs_[ch], nowUs_) + cfg_.channelXferUs;
+        dieFreeAtUs_[die] = std::max(dieFreeAtUs_[die], channelFreeAtUs_[ch]) + cfg_.slcTiming.programUs;
+        lastDoneUs_ = dieFreeAtUs_[die];
         
         return;   // done: don't fall through to the QLC path
     }
@@ -289,6 +301,12 @@ void Ftl::write(uint64_t lpn) {
     //   die += channelXferUs + QLC program
     channelBusyUs_[ch] += cfg_.channelXferUs;
     dieBusyUs_[die] += cfg_.channelXferUs + cfg_.timing.programUs;
+    // TODO E1 (event clock, QLC write): same 3 steps as the SLC write above, but with the QLC program time.
+    channelFreeAtUs_[ch] = std::max(channelFreeAtUs_[ch], nowUs_) + cfg_.channelXferUs;
+     //   2. the die programs: starts when BOTH the data is there and the die is free
+    dieFreeAtUs_[die] = std::max(dieFreeAtUs_[die], channelFreeAtUs_[ch]) + cfg_.timing.programUs;
+    //   3. the command is done when the program finishes
+    lastDoneUs_ = dieFreeAtUs_[die];
 }
 
 void Ftl::foldOneBlock() {
@@ -359,6 +377,7 @@ void Ftl::foldOneBlock() {
         // TODO G4 (fold copy): this die += SLC read + QLC program (copyback, no channel).
         // erase the victim from SLC as everything is moved to the QLC
         dieBusyUs_[die] += cfg_.slcTiming.readUs + cfg_.timing.programUs;
+        dieFreeAtUs_[die] = std::max(dieFreeAtUs_[die], nowUs_) + cfg_.slcTiming.readUs + cfg_.timing.programUs;
         
     }
 
@@ -376,6 +395,7 @@ void Ftl::foldOneBlock() {
     stats.simTimeUs += cfg_.slcTiming.eraseUs;
     // TODO G4 (fold erase): this die += SLC erase.
     dieBusyUs_[die] += cfg_.slcTiming.eraseUs;
+    dieFreeAtUs_[die] = std::max(dieFreeAtUs_[die], nowUs_) + cfg_.slcTiming.eraseUs;
 }
 
 void Ftl::idle(uint64_t us) {
@@ -400,7 +420,20 @@ int64_t Ftl::read(uint64_t lpn) {
         //   its channel += channelXferUs (the data comes back across the channel to the controller).
         dieBusyUs_[die] += cfg_.timing.readUs + cfg_.channelXferUs;
         channelBusyUs_[channelOf(die)] += cfg_.channelXferUs;
+        // TODO E2 (event clock, read): the REVERSE order of a write
+        //   1. the die reads the page: starts when the die is free AND the command has arrived, + readUs
+        dieFreeAtUs_[die] = std::max(dieFreeAtUs_[die], nowUs_) + cfg_.timing.readUs;
+        //   2. the data crosses the channel back: starts when the bus is free AND the read is done, + transfer
+        channelFreeAtUs_[channelOf(die)] = std::max(channelFreeAtUs_[channelOf(die)], dieFreeAtUs_[die]) + cfg_.channelXferUs;
+        //   3. done when the transfer finishes
+        //   (no `ch` variable here: use channelOf(die))
+        lastDoneUs_ = channelFreeAtUs_[channelOf(die)];
+    } 
+
+    else {
+        lastDoneUs_ = nowUs_;                                    // unmapped: answered at once
     }
+    
     return l2p[lpn];
 }
 

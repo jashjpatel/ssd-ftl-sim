@@ -72,6 +72,25 @@ int main() {
         std::snprintf(name, sizeof name, "%u ch x %u dies = %u dies", c.channels, c.diesPerChannel, dies);
         std::printf("%-26s %12llu %10.1f %8.1fx\n", name, (unsigned long long)t, 4096.0 * 4096.0 / double(t), double(base) / double(t));
     }
+    std::printf("\n-- 6. queue depth: 4 KB sequential writes, 8 dies (4 ch x 2), fresh drive\n");
+    std::printf("%-6s %10s %12s %10s %10s\n", "QD", "IOPS", "avg lat us", "p50 us", "p99 us");
+    for (uint32_t qd : {1u, 2u, 4u, 8u, 16u, 32u}) {
+        Config c = drive; c.slcBlocks = 0; c.channels = 4; c.diesPerChannel = 2; c.channelXferUs = 10;
+        WorkloadConfig wl; wl.pattern = Pattern::Sequential; wl.precondition = false;
+        const QdResult r = runQueueDepth(c, wl, qd, 4096);
+        std::printf("%-6u %10.0f %12.0f %10llu %10llu\n", qd, r.iops, r.avgLatencyUs,
+                    (unsigned long long)r.p50Us, (unsigned long long)r.p99Us);
+    }
+
+    std::printf("\n-- 7. GC tail latency: 4 KB random writes on a full drive, 8 dies, QD8\n");
+    {
+        Config c = drive; c.slcBlocks = 0; c.channels = 4; c.diesPerChannel = 2; c.channelXferUs = 10;
+        WorkloadConfig wl; wl.pattern = Pattern::UniformRandom; wl.precondition = true;
+        const QdResult r = runQueueDepth(c, wl, 8, 40000);
+        std::printf("IOPS %.0f   p50 %llu us   p99 %llu us   max %llu us   GC runs %llu\n", r.iops,
+                    (unsigned long long)r.p50Us, (unsigned long long)r.p99Us, (unsigned long long)r.maxUs,
+                    (unsigned long long)r.gcRuns);
+    }
     std::printf("\n");
     return 0;
 }
