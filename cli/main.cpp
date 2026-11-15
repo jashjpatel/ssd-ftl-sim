@@ -4,6 +4,7 @@
 #include <climits>
 #include "ftl.hpp"
 #include "nvme.hpp"
+#include "workload.hpp"
 
 static int failures = 0;
 #define CHECK(cond) do { if (!(cond)) { std::printf("  FAIL: %s (line %d)\n", #cond, __LINE__); ++failures; } } while (0)
@@ -427,6 +428,163 @@ static void tcN4_gc_latency_spike() {
     CHECK(ftl.checkInvariants());
 }
 
+// ---------------------------------------------------------------------------
+// Workloads (hour 4.75-5.5, second half)
+// ---------------------------------------------------------------------------
+static void tcW1_patterns() {
+    std::printf("TC-W1: sequential wraps, uniform stays in range, hot/cold hits the hot set ~80%%\n");
+    WorkloadConfig wc;
+    wc.pattern = Pattern::Sequential;
+    Workload seq(wc, 5);
+    const uint64_t expect[] = {0, 1, 2, 3, 4, 0, 1};
+    for (uint64_t e : expect) CHECK(seq.nextLba() == e);
+
+    wc.pattern = Pattern::UniformRandom;
+    Workload uni(wc, 100);
+    bool inRange = true, sawLow = false, sawHigh = false;
+    for (int i = 0; i < 10000; ++i) {
+        const uint64_t l = uni.nextLba();
+        inRange = inRange && l < 100; sawLow = sawLow || l < 10; sawHigh = sawHigh || l >= 90;
+    }
+    CHECK(inRange && sawLow && sawHigh);                // spread over the whole drive
+
+    wc.pattern = Pattern::HotCold; wc.hotFraction = 0.2; wc.hotProbability = 0.8;
+    Workload hc(wc, 1000);                             // hot set = LBAs 0..199
+    int hot = 0; bool hcRange = true, sawCold = false;
+    for (int i = 0; i < 100000; ++i) {
+        const uint64_t l = hc.nextLba();
+        hcRange = hcRange && l < 1000;
+        if (l < 200) ++hot; else sawCold = true;
+    }
+    std::printf("  hot/cold: %.1f%% of writes went to the hot 20%%\n", hot / 1000.0);
+    CHECK(hcRange && sawCold);
+    CHECK(hot > 78000 && hot < 82000);                 // about 80%
+}
+
+static void tcW2_experiment_loop() {
+    std::printf("TC-W2: runExperiment measures every command\n");
+    Config d = slcConfig();
+    WorkloadConfig wc;
+    wc.pattern = Pattern::Sequential; wc.bursts = 3; wc.burstCommands = 4; wc.precondition = false;
+    ExperimentResult r = runExperiment(d, wc);         // 3 bursts x 4 writes, no idle
+    CHECK(r.hostWrites == 12 && r.latenciesUs.size() == 12);
+    if (r.latenciesUs.size() == 12) {                  // only index if the loop recorded everything
+        CHECK(r.latenciesUs[0] == 150 && r.latenciesUs[3] == 150);   // first 4 fill the 4-page SLC cache
+        CHECK(r.latenciesUs[4] == 2500);               // 5th write: the cliff
+    }
+    CHECK(r.slowCommands == 8 && r.maxLatencyUs == 2500);
+    wc.idleUs = 1000000;                               // now idle 1 s after every burst
+    r = runExperiment(d, wc);
+    CHECK(r.slowCommands == 0 && r.folds == 6);        // 2 SLC blocks folded after each of the 3 bursts
+    CHECK(r.avgLatencyUs == 150);
+}
+
+// ---------------------------------------------------------------------------
+// Step 1: geometry + parallelism
+// ---------------------------------------------------------------------------
+// 2 channels x 2 dies = 4 dies, 16 blocks x 4 pages (4 blocks per die), no SLC
+static Config geoConfig(uint32_t channels, uint32_t diesPerChannel) {
+    Config c;
+    c.blocks = 16; c.pagesPerBlock = 4; c.opRatio = 0.25; c.slcBlocks = 0;
+    c.channels = channels; c.diesPerChannel = diesPerChannel; c.planesPerDie = 2;
+    return c;
+}
+
+static void tcG1_geometry_decode() {
+    std::printf("TC-G1: blocks interleave across dies, dies across channels\n");
+    Ftl ftl(geoConfig(2, 2));
+    CHECK(ftl.numDies() == 4);
+    CHECK(ftl.dieOf(0) == 0 && ftl.dieOf(1) == 1 && ftl.dieOf(5) == 1 && ftl.dieOf(15) == 3);
+    CHECK(ftl.channelOf(0) == 0 && ftl.channelOf(1) == 1 && ftl.channelOf(2) == 0 && ftl.channelOf(3) == 1);
+    const PhysAddr a = ftl.decode(6 * 4 + 2);          // block 6, page 2
+    CHECK(a.block == 6 && a.page == 2);
+    CHECK(a.die == 2 && a.channel == 0);
+    CHECK(a.plane == 1);                               // 2nd block on die 2 -> plane 1
+    bool rejected = false;
+    Config bad = geoConfig(2, 2); bad.blocks = 18;     // 18 blocks don't split evenly over 4 dies
+    try { Ftl x(bad); } catch (const std::invalid_argument&) { rejected = true; }
+    CHECK(rejected);
+}
+
+static void tcG2_slc_spread() {
+    std::printf("TC-G2: the SLC cache is spread over every die\n");
+    Config c = geoConfig(2, 2);
+    c.blocks = 32; c.pagesPerBlock = 8; c.slcBlocks = 4;
+    Ftl ftl(c);
+    for (uint32_t b = 0; b < 4; ++b) {
+        CHECK(ftl.nand().block(b).mode == CellMode::SLC);
+        CHECK(ftl.dieOf(b) == b);                      // SLC blocks 0..3 sit on dies 0..3
+    }
+    for (uint64_t l = 0; l < 4; ++l) ftl.write(l);     // 4 writes: one per die, all SLC
+    for (uint64_t l = 0; l < 4; ++l) CHECK(ftl.decode(uint64_t(ftl.read(l))).die == l);
+    CHECK(ftl.stats.slcWrites == 4);
+}
+
+static void tcG3_striping() {
+    std::printf("TC-G3: consecutive writes stripe round-robin across dies\n");
+    Ftl ftl(geoConfig(2, 2));
+    for (uint64_t l = 0; l < 8; ++l) ftl.write(l);
+    for (uint64_t l = 0; l < 8; ++l) CHECK(ftl.decode(uint64_t(ftl.read(l))).die == l % 4);
+    for (uint32_t d = 0; d < 4; ++d) CHECK(ftl.activeBlock(d) >= 0 && ftl.dieOf(uint32_t(ftl.activeBlock(d))) == d);
+    CHECK(ftl.checkInvariants());
+}
+
+static void tcG4_per_die_gc() {
+    std::printf("TC-G4: GC and wear leveling stay inside each die\n");
+    Config c; c.slcBlocks = 16; c.channels = 2; c.diesPerChannel = 4;   // 8 dies, 32 blocks each
+    Ftl ftl(c);
+    std::vector<int64_t> dieAtWrite(ftl.logicalPages(), -1);   // which die each LBA was last written to
+    uint64_t x = 99, wrongDie = 0;
+    for (int i = 0; i < 200000; ++i) {
+        x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+        const uint64_t l = (x >> 33) % ftl.logicalPages();
+        ftl.write(l);
+        dieAtWrite[l] = ftl.decode(uint64_t(ftl.read(l))).die;
+        if (dieAtWrite[l] != i % 8) ++wrongDie;                // striping: write i goes to die i % 8
+        if (i % 5000 == 4999) ftl.idle(10000000);
+    }
+    CHECK(wrongDie == 0);
+    CHECK(ftl.checkInvariants());
+    uint64_t moved = 0;                                        // GC and folds must never move data to another die
+    for (uint64_t l = 0; l < ftl.logicalPages(); ++l)
+        if (dieAtWrite[l] >= 0 && int64_t(ftl.decode(uint64_t(ftl.read(l))).die) != dieAtWrite[l]) ++moved;
+    CHECK(moved == 0);
+    for (uint32_t d = 0; d < ftl.numDies(); ++d) {
+        CHECK(ftl.activeBlock(d) < 0 || ftl.dieOf(uint32_t(ftl.activeBlock(d))) == d);
+        uint32_t erases = 0;
+        for (uint32_t b = d; b < c.blocks; b += ftl.numDies()) erases += ftl.nand().block(b).eraseCount;
+        CHECK(erases > 0);                             // every die did its share of GC
+    }
+    std::printf("  8 dies: WAF %.2f, GC runs %llu, folds %llu\n", ftl.stats.waf(),
+                (unsigned long long)ftl.stats.gcRuns, (unsigned long long)ftl.stats.folds);
+}
+
+static uint64_t makespanFor(uint32_t channels, uint32_t diesPerChannel, uint32_t xferUs) {
+    Config c; c.slcBlocks = 0; c.channels = channels; c.diesPerChannel = diesPerChannel;
+    c.timing = {80, 2500, 3000}; c.channelXferUs = xferUs;
+    Ftl ftl(c);
+    for (uint64_t l = 0; l < 1024; ++l) ftl.write(l);  // 1024 sequential writes, fresh drive (no GC)
+    return ftl.makespanUs();
+}
+
+static void tcG5_parallel_speedup() {
+    std::printf("TC-G5: more dies -> more parallel writes, until a channel saturates\n");
+    const uint64_t t1 = makespanFor(1, 1, 10), t4 = makespanFor(2, 2, 10), t8 = makespanFor(2, 4, 10);
+    std::printf("  1 die %llu us, 4 dies %llu us (%.1fx), 8 dies %llu us (%.1fx)\n",
+                (unsigned long long)t1, (unsigned long long)t4, double(t1) / t4,
+                (unsigned long long)t8, double(t1) / t8);
+    CHECK(t1 == 1024 * (10 + 2500));                   // one die does everything, one after another
+    CHECK(t4 * 4 == t1 && t8 * 8 == t1);               // perfect striping: each die does 1/N of the work
+    // a slow channel shared by 8 dies becomes the bottleneck
+    Config c; c.slcBlocks = 0; c.channels = 1; c.diesPerChannel = 8; c.timing = {80, 2500, 3000}; c.channelXferUs = 500;
+    Ftl ftl(c);
+    for (uint64_t l = 0; l < 1024; ++l) ftl.write(l);
+    std::printf("  1 channel x 8 dies, 500 us transfers: channel busy %llu us, busiest die %llu us\n",
+                (unsigned long long)ftl.channelBusyUs(0), (unsigned long long)ftl.dieBusyUs(0));
+    CHECK(ftl.makespanUs() == ftl.channelBusyUs(0));   // channel-bound, not die-bound
+    CHECK(ftl.channelBusyUs(0) == 1024 * 500);
+}
+
 static void run(void (*test)()) {
     try { test(); }
     catch (const std::exception& e) { std::printf("  FAIL: exception: %s\n", e.what()); ++failures; }
@@ -454,6 +612,13 @@ int main() {
     run(tcN2_errors_are_statuses);
     run(tcN3_trim_then_read);
     run(tcN4_gc_latency_spike);
+    run(tcW1_patterns);
+    run(tcW2_experiment_loop);
+    run(tcG1_geometry_decode);
+    run(tcG2_slc_spread);
+    run(tcG3_striping);
+    run(tcG4_per_die_gc);
+    run(tcG5_parallel_speedup);
     std::printf(failures ? "\n%d CHECK(s) FAILED\n" : "\nAll checks passed\n", failures);
     return failures ? 1 : 0;
 }

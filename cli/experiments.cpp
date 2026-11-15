@@ -55,6 +55,23 @@ int main() {
         std::snprintf(name, sizeof name, "%2u SLC blocks (capacity %llu LBAs)", n, (unsigned long long)r.logicalPages);
         row(name, r);
     }
+    std::printf("\n-- 5. parallelism: 4,096 sequential writes on a fresh drive (QLC 2500 us program, 10 us channel transfer)\n");
+    std::printf("%-26s %12s %10s %9s\n", "geometry", "makespan us", "MB/s", "speedup");
+    uint64_t base = 0;
+    for (uint32_t dies : {1u, 2u, 4u, 8u, 16u}) {
+        Config c = drive;
+        c.slcBlocks = 0;
+        c.channels = dies < 4 ? dies : 4;            // up to 4 channels, the rest share them
+        c.diesPerChannel = dies / c.channels;
+        c.channelXferUs = 10;
+        Ftl ftl(c);
+        for (uint64_t l = 0; l < 4096; ++l) ftl.write(l);
+        const uint64_t t = ftl.makespanUs();
+        if (dies == 1) base = t;
+        char name[64];
+        std::snprintf(name, sizeof name, "%u ch x %u dies = %u dies", c.channels, c.diesPerChannel, dies);
+        std::printf("%-26s %12llu %10.1f %8.1fx\n", name, (unsigned long long)t, 4096.0 * 4096.0 / double(t), double(base) / double(t));
+    }
     std::printf("\n");
     return 0;
 }

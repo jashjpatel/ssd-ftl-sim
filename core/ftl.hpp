@@ -16,7 +16,18 @@ struct Config {
     uint32_t   slcBlocks   = 16;             // first N blocks run in SLC mode (the write cache)
     NandTiming slcTiming{20, 150, 3000};     // SLC region timing
     bool       foldOnIdle  = true;           // move SLC data to QLC during idle time
+
+    // ---- geometry (Step 1) ----
+    uint32_t   channels       = 1;           // NAND channels (independent buses)
+    uint32_t   diesPerChannel = 1;           // dies sharing each channel
+    uint32_t   planesPerDie   = 1;           // used for addressing only (multi-plane ops come later)
+    uint32_t   channelXferUs  = 0;           // time to move one page over a channel (0 = ignore)
 };
+
+// Where a physical page really is. Blocks are interleaved across dies (block b lives on die
+// b % numDies) and dies across channels (die d sits on channel d % channels), so consecutive
+// blocks, including the SLC cache, are spread over every die and channel.
+struct PhysAddr { uint32_t channel, die, plane, block, page; };
 
 struct Stats {
     uint64_t hostWrites = 0, nandWrites = 0, hostReads = 0;
@@ -38,8 +49,17 @@ public:
     size_t freeBlocks() const { return freeBlocks_.size(); }        // QLC free pool
     size_t freeSlcBlocks() const { return freeSlcBlocks_.size(); }
     size_t fullSlcBlocks() const { return fullSlcBlocks_.size(); }
-    int64_t activeBlock() const { return activeBlock_; }         // QLC active block (-1 = none), for the GUI
-    int64_t activeSlcBlock() const { return activeSlcBlock_; }   // SLC active block (-1 = none), for the GUI
+    int64_t activeBlock(uint32_t die = 0) const { return activeBlock_[die]; }         // QLC active block of a die (-1 = none)
+    int64_t activeSlcBlock(uint32_t die = 0) const { return activeSlcBlock_[die]; }   // SLC active block of a die (-1 = none)
+
+    // ---- geometry (Step 1) ----
+    uint32_t numDies() const { return cfg_.channels * cfg_.diesPerChannel; }
+    uint32_t dieOf(uint32_t b) const;          // which die block b is on
+    uint32_t channelOf(uint32_t die) const;    // which channel a die is on
+    PhysAddr decode(uint64_t ppn) const;       // flat PPN -> channel/die/plane/block/page
+    uint64_t dieBusyUs(uint32_t die) const { return dieBusyUs_[die]; }
+    uint64_t channelBusyUs(uint32_t ch) const { return channelBusyUs_[ch]; }
+    uint64_t makespanUs() const;               // time if dies and channels work in parallel = the busiest one
     int64_t lpnAt(uint64_t ppn) const { return p2l[ppn]; }       // PPN -> LPN (-1 = none), for the GUI
     int64_t ppnOf(uint64_t lpn) const { return l2p[lpn]; }       // LPN -> PPN (-1 = unmapped), no side effects
 
@@ -52,9 +72,9 @@ public:
     Stats stats;
 
 private:
-    uint32_t allocateBlock();     // runs GC if needed, returns the block to write next
-    uint32_t takeFreeBlock();     // wear leveling: lowest-eraseCount free block
-    void     runGc();             // reclaim one block
+    uint32_t allocateBlock(uint32_t die);   // runs GC on that die if needed, returns its block to write next
+    uint32_t takeFreeBlock(uint32_t die);   // wear leveling: lowest-eraseCount free block ON THAT DIE
+    void     runGc(uint32_t die);           // reclaim one block on that die
     void     foldOneBlock();      // oldest full SLC block -> valid pages to QLC -> erase it
     uint64_t tick_ = 0;
     Config cfg_;
@@ -62,8 +82,11 @@ private:
     std::vector<int64_t> l2p;  // LPN -> PPN (-1 = unmapped)
     std::vector<int64_t> p2l;  // PPN -> LPN (-1 = none)
     std::deque<uint32_t> freeBlocks_;
-    int64_t activeBlock_ = -1;                // QLC active block
-    int64_t activeSlcBlock_ = -1;             // SLC active block
+    std::vector<int64_t> activeBlock_;        // QLC active block, one per die (-1 = none)
+    std::vector<int64_t> activeSlcBlock_;     // SLC active block, one per die (-1 = none)
+    uint32_t nextDie_ = 0;                    // round-robin striping: die for the next host write
+    std::vector<uint64_t> dieBusyUs_;         // total time each die has spent working
+    std::vector<uint64_t> channelBusyUs_;     // total time each channel has spent transferring
     std::deque<uint32_t> freeSlcBlocks_;      // erased SLC blocks
     std::deque<uint32_t> fullSlcBlocks_;      // full SLC blocks, oldest first (folded in hour 4)
 };
